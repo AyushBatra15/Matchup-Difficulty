@@ -1,0 +1,923 @@
+---
+title: "Defensive Matchup Difficulty"
+author: "Ayush Batra"
+date: "2023-04-12"
+output: pdf_document
+---
+
+This is the code used to create the stats and visualizations for my post on defensive matchup difficulty.
+
+You can read the post here: https://bestballstats.com/2023/04/12/defensive-matchup-difficulty-which-nba-players-face-off-against-the-best/
+
+First, we must load in the packages that I used. 
+
+```{r}
+#| label: load-packages
+
+library(tidyverse)
+library(hoopR)
+library(nbastatR)
+library(gt)
+library(webshot)
+library(ggimage)
+library(scales)
+Sys.setenv("VROOM_CONNECTION_SIZE" = 2*131072)
+
+```
+
+The following code creates a table of NBA player and team information in the environment, and it also sets the season to analyze and minutes minimums. Note that the minimum minutes for offensive players is lower than the minutes minimum for defensive players since the only reason for having an offensive minutes minimum is to ensure that the PTS/100 numbers are not crazy outliers. The defensive minutes minimum is much higher because I only wanted to rank defenders that consistently played throughout the season. 
+
+```{r}
+#| label: constants
+
+assign_nba_teams()
+assign_nba_players()
+
+SEASON = "2022-23"
+OFF_MINIMUM = 300 # This is the minimum minutes for offensive players
+DEF_MINIMUM = 1000 # This is the minimum minutes for defensive players
+```
+
+First, I loaded in the offensive scoring data and minutes data using `hoopr`. This data can be used to determine which offensive players are the best scorers. 
+
+# Calculating Defensive Matchup Difficulty
+
+```{r}
+#| label: offense-stats
+
+offense <- nba_leaguedashplayerstats(season = SEASON,
+                                     per_mode = "Per100Possessions",
+                                     season_type = "Regular Season")
+offense <- offense[["LeagueDashPlayerStats"]]
+
+minutes <- nba_leaguedashplayerstats(season = SEASON,
+                                     season_type = "Regular Season")
+minutes <- minutes[["LeagueDashPlayerStats"]]
+
+offense <- offense %>%
+  select(PLAYER_ID, PLAYER_NAME, TEAM = TEAM_ABBREVIATION, AGE, GP, FGM, FGA,
+         FG3M, FG3A, FTM, FTA, OREB, AST, TOV, PFD, PTS) %>%
+  mutate(across(c(AGE : PTS), as.numeric))
+
+minutes <- minutes %>%
+  select(PLAYER_ID, MIN) %>%
+  mutate(MIN = round(as.numeric(MIN)))
+
+offense <- offense %>%
+  inner_join(minutes, by = "PLAYER_ID") %>%
+  relocate(MIN, .after = GP) %>%
+  filter(MIN >= OFF_MINIMUM)
+
+points <- offense %>%
+  select(PLAYER_ID, PTS)
+
+```
+
+Next, I looped over all 30 NBA teams to acquire their matchup data. Using the matchup data in conjunction with scoring data allows us to calculate the defensive matchup difficulty of all qualifying defenders in 2022-23. Note that the `avg_PTS` variable represents defensive matchup difficulty. 
+
+```{r}
+#| label: dmd-calculation
+
+team_info <- df_dict_nba_teams %>%
+  filter(idTeam <= 1610612766 & idTeam >= 1610612737) %>%
+  select(nameTeam, slugTeam, idTeam, colorsTeam, urlThumbnailTeam)
+
+list_IDs <- team_info %>%
+  pull(idTeam) %>%
+  as.character()
+
+all <- tibble()
+iter <- 0
+
+for (id in list_IDs) {
+  slug <- team_info %>%
+    filter(idTeam == as.numeric(id)) %>%
+    select(slugTeam) %>%
+    pull()
+  
+  matchups <- nba_leagueseasonmatchups(def_team_id = id,
+                                       season = SEASON)
+  matchups <- matchups[["SeasonMatchups"]]
+  
+  matchups <- matchups %>%
+    inner_join(points, by = c("OFF_PLAYER_ID" = "PLAYER_ID")) %>%
+    rename(SEASON_PTS_100 = PTS)
+  
+  tm_def_matchups <- matchups %>%
+    mutate(across(c(PARTIAL_POSS : MATCHUP_TIME_SEC), as.numeric)) %>%
+    group_by(DEF_PLAYER_ID) %>%
+    summarize(PLAYER_NAME = first(DEF_PLAYER_NAME),
+              POSS = sum(PARTIAL_POSS),
+              avg_PTS = weighted.mean(SEASON_PTS_100, w = PARTIAL_POSS),
+              simple_eff = sum(PLAYER_PTS) / 
+                (sum(MATCHUP_FGA) + sum(MATCHUP_TOV) + 
+                   0.44*sum(MATCHUP_FTA))) %>%
+    ungroup() %>%
+    mutate(slugTeam = slug)
+  
+  all <- rbind(all, tm_def_matchups)
+  
+  iter <- iter + 1
+  print(paste("Loaded ",iter,"/30 Teams", sep = ""))
+}
+
+matchup_diff <- all %>%
+  inner_join(minutes, by = c("DEF_PLAYER_ID" = "PLAYER_ID")) %>%
+  filter(MIN >= DEF_MINIMUM) %>%
+  arrange(-avg_PTS)
+
+matchup_diff <- matchup_diff %>%
+  mutate(PCT_Diff = rank(avg_PTS) / nrow(matchup_diff),
+         PCT_Eff = rank(-simple_eff) / nrow(matchup_diff))
+
+
+# This loop should run fine, but in case it times out you can access the data 
+# from the github repository. 
+# Uncomment the line below to access the data this way
+
+# matchup_diff <- read_csv(file = "https://raw.githubusercontent.com/AyushBatra15/Matchup-Difficulty/main/data/matchup_diff.csv")
+
+
+# This plots a histogram of defensive matchup difficulty values for players
+# in 2022-23
+matchup_diff %>%
+  ggplot(aes(x = avg_PTS)) +
+  geom_histogram(fill = '#c652ad', color = 'black', binwidth = 0.5) +
+  labs(x = "Matchup Difficulty (avg opponent season PTS / 100)",
+       y = "Count",
+       title = "Defensive Matchup Difficulty: Distribution",
+       subtitle = "Stats from 2023 Regular Season",
+       caption = "Data via NBA.com and hoopR | Graph by Ayush Batra")
+
+# These lines get the urls for player headshot images and team logos
+headshots <- df_dict_nba_players %>%
+  select(idPlayer, urlPlayerHeadshot)
+tm_logos <- espn_nba_teams() %>%
+  select(display_name, logo) %>%
+  mutate(display_name = ifelse(display_name == "LA Clippers",
+                               "Los Angeles Clippers",
+                               display_name))
+
+tm_conversion <- team_info %>%
+  select(slugTeam, nameTeam)
+
+now_teams <- offense %>%
+  select(PLAYER_ID, TEAM)
+
+# This provides a color scale for the table
+color_scale <- col_numeric(c("#E09D9D","#E4DBD7","#87B87E"), 
+                           domain = c(0, 100), 
+                           alpha = 0.75)
+
+# This creates a table of the top 10 players with the highest defensive matchup difficulty in 2022-23
+top10 <- matchup_diff %>%
+  group_by(DEF_PLAYER_ID) %>%
+  summarize(PLAYER_NAME = first(PLAYER_NAME),
+            MIN = mean(MIN),
+            avg_PTS = weighted.mean(avg_PTS, w = POSS),
+            simple_eff = weighted.mean(simple_eff, w = POSS)) %>%
+  ungroup() %>%
+  mutate(PCT_Diff = rank(avg_PTS) / 
+           nrow(distinct(matchup_diff, DEF_PLAYER_ID)),
+         PCT_Eff = rank(-simple_eff) / 
+           nrow(distinct(matchup_diff, DEF_PLAYER_ID)),
+         PCT_Diff = 100 * PCT_Diff,
+         PCT_Eff = 100 * PCT_Eff) %>%
+  mutate(DEF_PLAYER_ID = as.character(DEF_PLAYER_ID)) %>%
+  left_join(now_teams, by = c("DEF_PLAYER_ID" = "PLAYER_ID")) %>%
+  mutate(DEF_PLAYER_ID = as.numeric(DEF_PLAYER_ID)) %>%
+  left_join(headshots, by = c("DEF_PLAYER_ID" = "idPlayer")) %>%
+  left_join(tm_conversion, by = c("TEAM" = "slugTeam")) %>%
+  left_join(tm_logos, by = c("nameTeam" = "display_name")) %>%
+  mutate(Rk = rank(-avg_PTS)) %>%
+  filter(Rk <= 10) %>%
+  select(Rk, urlPlayerHeadshot, PLAYER_NAME, logo, MIN, avg_PTS, PCT_Diff,
+         simple_eff, PCT_Eff) %>%
+  arrange(Rk) %>%
+  gt() %>%
+  tab_header(title = "Top 10: Defenders with Greatest Matchup Difficulty",
+             subtitle = "2022-23 NBA Regular Season | At least 1000 minutes") %>%
+  cols_label(urlPlayerHeadshot = "",
+             PLAYER_NAME = "Player",
+             logo = "Tm",
+             avg_PTS = "DMD",
+             PCT_Diff = "Pct",
+             simple_eff = "Efficiency",
+             PCT_Eff = "Pct") %>%
+  fmt_number(c(avg_PTS), decimals = 1) %>%
+  fmt_number(c(simple_eff), decimals = 3) %>%
+  fmt_number(c(PCT_Diff, PCT_Eff), decimals = 0) %>%
+  tab_spanner(label = "Matchup Difficulty",
+              columns = c(avg_PTS, PCT_Diff)) %>%
+  tab_spanner(label = "Def. Efficiency",
+              columns = c(simple_eff, PCT_Eff)) %>%
+  tab_footnote(footnote = "Minutes Played", 
+               locations = cells_column_labels(columns = c(MIN))) %>%
+  tab_footnote(footnote = paste("DMD: Defensive Matchup Difficulty = Weighted",
+                                "Average of Offensive Matchup's Season Points", 
+                                "per 100 Possessions"), 
+               locations = cells_column_labels(columns = c(avg_PTS))) %>%
+  tab_footnote(footnote = "Pct: Percentile", 
+               locations = cells_column_labels(columns = c(PCT_Diff, 
+                                                           PCT_Eff))) %>%
+  tab_footnote(footnote = paste("Efficiency: PTS / (FGA + TOV + 0.44 * FTA)", 
+                                "for offensive players guarded"), 
+               locations = cells_column_labels(columns = c(simple_eff))) %>%
+  tab_style(list(cell_text(weight = 'bold', 
+                           align = 'center', 
+                           stretch = 'expanded')),
+            locations = cells_column_labels()) %>%
+  tab_style(list(cell_text(weight = 'bold', 
+                           align = 'center', 
+                           transform = 'uppercase', 
+                           stretch = 'expanded')),
+            locations = cells_column_spanners()) %>%
+  tab_style(list(cell_text(align = 'center')), 
+            locations = cells_body(columns = c(urlPlayerHeadshot, logo))) %>%
+  tab_style(list(cell_text(size = 20)),
+            locations = cells_body()) %>%
+  tab_style(list(cell_borders(sides = 'bottom', weight = px(3))),
+            locations = cells_column_labels()) %>%
+  data_color(columns = c(PCT_Diff, PCT_Eff), colors = color_scale) %>%
+  text_transform(locations = cells_body(columns = c(urlPlayerHeadshot, logo)),
+                 fn = function(x) {
+                   web_image(
+                     url = x,
+                     height = 50
+                   )
+                 }
+  ) %>%
+  cols_width(columns = c(avg_PTS, simple_eff, PCT_Diff, PCT_Eff) ~ px(80)) %>%
+  tab_options(column_labels.border.bottom.width = 3,
+              column_labels.border.bottom.color = 'black',
+              table_body.hlines.color = 'black',
+              footnotes.border.bottom.color = 'black',
+              table_body.border.bottom.color = 'black',
+              table.border.bottom.color = 'black',
+              table.border.top.color = 'black',
+              table.border.left.color = 'black',
+              table.border.right.color = 'black')
+
+top10
+
+
+```
+
+The code below provides a function to get defensive matchup difficulty for any year (when there is tracking data available) for either the playoffs or the regular season. While the function should work, it may time out if you try to use it so I uploaded any data I gathered using this function to the respository so it can be easily accessed. 
+
+```{r}
+#| label: function
+get_matchup_diff <- function(str_season, off_min, def_min, 
+                             s_type = "Regular Season") {
+  
+  offense <- nba_leaguedashplayerstats(season = str_season,
+                                       per_mode = "Per100Possessions",
+                                       season_type = "Regular Season")
+  offense <- offense[["LeagueDashPlayerStats"]]
+  
+  minutes <- nba_leaguedashplayerstats(season = str_season,
+                                       season_type = "Regular Season")
+  minutes <- minutes[["LeagueDashPlayerStats"]]
+  
+  offense <- offense %>%
+    select(PLAYER_ID, PLAYER_NAME, TEAM = TEAM_ABBREVIATION, AGE, GP, FGM, FGA,
+           FG3M, FG3A, FTM, FTA, OREB, AST, TOV, PFD, PTS) %>%
+    mutate(across(c(AGE : PTS), as.numeric))
+  
+  minutes <- minutes %>%
+    select(PLAYER_ID, MIN) %>%
+    mutate(MIN = round(as.numeric(MIN)))
+  
+  offense <- offense %>%
+    inner_join(minutes, by = "PLAYER_ID") %>%
+    relocate(MIN, .after = GP) %>%
+    filter(MIN >= off_min)
+  
+  offense <- offense %>%
+    mutate(efficiency = PTS / (FGA + TOV + 0.44*FTA))
+  
+  points <- offense %>%
+    select(PLAYER_ID, PTS, efficiency)
+  
+  list_IDs <- team_info %>%
+    pull(idTeam) %>%
+    as.character()
+  
+  all <- tibble()
+  iter <- 0
+  
+  for (id in list_IDs) {
+    slug <- team_info %>%
+      filter(idTeam == as.numeric(id)) %>%
+      select(slugTeam) %>%
+      pull()
+    
+    matchups <- nba_leagueseasonmatchups(def_team_id = id,
+                                         season = str_season,
+                                         season_type = s_type)
+    matchups <- matchups[["SeasonMatchups"]]
+    
+    n <- nrow(matchups)
+    
+    if (n > 0) {
+      
+      matchups <- matchups %>%
+        inner_join(points, by = c("OFF_PLAYER_ID" = "PLAYER_ID")) %>%
+        rename(SEASON_PTS_100 = PTS)
+      
+      tm_def_matchups <- matchups %>%
+        mutate(across(c(PARTIAL_POSS : MATCHUP_TIME_SEC), as.numeric)) %>%
+        mutate(expected_pts = efficiency * 
+                 (MATCHUP_FGA + MATCHUP_TOV + 0.44*MATCHUP_FTA)) %>%
+        group_by(DEF_PLAYER_ID) %>%
+        summarize(PLAYER_NAME = first(DEF_PLAYER_NAME),
+                  POSS = sum(PARTIAL_POSS),
+                  avg_PTS = weighted.mean(SEASON_PTS_100, w = PARTIAL_POSS),
+                  simple_eff = sum(PLAYER_PTS) / 
+                    ( sum(MATCHUP_FGA) + sum(MATCHUP_TOV) + 
+                       0.44*sum(MATCHUP_FTA) ),
+                  expected = sum(expected_pts) / 
+                    ( sum(MATCHUP_FGA) + sum(MATCHUP_TOV) + 
+                       0.44*sum(MATCHUP_FTA) ),
+                  over_exp = simple_eff - expected) %>%
+        ungroup() %>%
+        mutate(slugTeam = slug)
+      
+      all <- rbind(all, tm_def_matchups)
+      
+    }
+    
+    iter <- iter + 1
+    print(paste("Loaded ",iter,"/30 Teams", sep = ""))
+    
+  }
+  
+  if (s_type == "Playoffs") {
+    minutes <- nba_leaguedashplayerstats(season = str_season,
+                                         season_type = s_type)
+    minutes <- minutes[["LeagueDashPlayerStats"]]
+    
+    minutes <- minutes %>%
+      select(PLAYER_ID, MIN) %>%
+      mutate(MIN = round(as.numeric(MIN)))
+  }
+  
+  matchup_diff <- all %>%
+    inner_join(minutes, by = c("DEF_PLAYER_ID" = "PLAYER_ID")) %>%
+    filter(MIN >= def_min) %>%
+    arrange(-avg_PTS)
+  
+  matchup_diff <- matchup_diff %>%
+    mutate(PCT_Diff = rank(avg_PTS) / nrow(matchup_diff),
+           PCT_Eff = rank(-over_exp) / nrow(matchup_diff))
+  
+  return(matchup_diff)
+  
+}
+
+```
+
+# Consistency
+
+Now we can examine the consistency of defensive matchup difficulty. I calculated defensive matchup difficulty ratings for 2021-22 and saw how this related to the stats for 2022-23. 
+
+```{r}
+#| label: consist
+
+# matchups22 <- get_matchup_diff("2021-22", 300, 1000)
+f <- paste("https://raw.githubusercontent.com/AyushBatra15/Matchup-Difficulty",
+           "/main/data/matchups22.csv", sep = "")
+matchups22 <- read_csv(file = f)
+matchups23 <- matchup_diff
+both <- matchups22 %>%
+  mutate(DEF_PLAYER_ID = as.character(DEF_PLAYER_ID)) %>%
+  inner_join(matchups23, 
+             by = "DEF_PLAYER_ID", 
+             suffix = c(".22",".23"),
+             relationship = "many-to-many") %>%
+  select(-PLAYER_NAME.23) %>%
+  rename(PLAYER_NAME = PLAYER_NAME.22)
+
+both %>%
+  ggplot(aes(x = avg_PTS.22, y = avg_PTS.23)) +
+  geom_point(shape = 21, fill = "#c652ad", color = 'black', size = 2) +
+  geom_smooth(se = F, method = lm) +
+  labs(x = "Matchup Difficulty in 2022",
+       y = "Matchup Difficulty in 2023",
+       title = "Matchup Difficulty is a Highly Consistent Stat",
+       caption = "Data via NBA.com and hoopR | Graph by Ayush Batra") +
+  annotate("text", x = 20.5, y = 26.5, label = "r = 0.764",
+           size = 7)
+
+# This outputs the year-to-year correlation for defensive matchup difficulty
+cor(both$avg_PTS.22, both$avg_PTS.23)
+
+both %>%
+  ggplot(aes(x = simple_eff.22, y = simple_eff.23)) +
+  geom_point(shape = 21, fill = "#c652ad", color = 'black', size = 2) +
+  geom_smooth(se = F, method = lm) +
+  labs(x = "Defensive Efficiency in 2022",
+       y = "Defensive Efficiency in 2023",
+       title = "Defensive Efficiency is a Very Inconsistent Stat",
+       caption = "Data via NBA.com and hoopR | Graph by Ayush Batra") +
+  annotate("text", x = 0.82, y = 1.23, label = "r = 0.223",
+           size = 7) 
+
+# This outputs the year-to-year correlation for defensive efficiency
+cor(both$simple_eff.22, both$simple_eff.23)
+
+```
+
+# Relationship with Steals and Blocks
+
+Then, I looked at how defensive matchup difficulty is related to other defensive stats like steals and blocks. 
+
+```{r}
+#| label: stl-blk
+
+defense <- nba_leaguedashplayerstats(measure_type = "Defense",
+                                     season = SEASON)
+defense <- defense[["LeagueDashPlayerStats"]]
+
+defense <- defense %>%
+  mutate(across(c(AGE : DEF_WS), as.numeric)) %>%
+  mutate(MIN = round(MIN),
+         STL_48 = STL / MIN * 48,
+         BLK_48 = BLK / MIN * 48) %>%
+  select(PLAYER_ID, AGE, STL_48, BLK_48)
+
+defense <- defense %>%
+  #mutate(PLAYER_ID = as.numeric(PLAYER_ID)) %>%
+  inner_join(matchup_diff, by = c("PLAYER_ID" = "DEF_PLAYER_ID"))
+
+# This looks at the relationship between matchup difficulty and steals
+defense %>%
+  mutate(PLAYER_ID = as.numeric(PLAYER_ID)) %>%
+  left_join(headshots, by = c("PLAYER_ID" = "idPlayer")) %>%
+  mutate(radius = ((STL_48 - 1.5)/0.75)^2 + ((avg_PTS - 23)/2.5)^2) %>%
+  mutate(img = ifelse(radius > 1 & avg_PTS > 23 & STL_48 > 1.5, 
+                      urlPlayerHeadshot, NA)) %>%
+  ggplot(aes(x = STL_48, y = avg_PTS)) +
+  geom_point(shape = 21, fill = "#c652ad", color = 'black') +
+  geom_image(aes(image = img), size = 0.10) +
+  geom_smooth(se = F, method = lm) +
+  labs(x = "Steals per 48 minutes",
+       y = "Matchup Difficulty",
+       title = "Steals and Matchup Difficulty are Associated",
+       subtitle = "2022-23 Season",
+       caption = "Data via NBA.com and hoopR | Graph by Ayush Batra")
+
+# This looks at the relationship between matchup difficulty and blocks
+defense %>%
+  mutate(PLAYER_ID = as.numeric(PLAYER_ID)) %>%
+  left_join(headshots, by = c("PLAYER_ID" = "idPlayer")) %>%
+  mutate(img = ifelse(BLK_48 > 2.5, urlPlayerHeadshot, NA)) %>%
+  ggplot(aes(x = BLK_48, y = avg_PTS)) +
+  geom_point(shape = 21, fill = "#c652ad", color = 'black') +
+  geom_image(aes(image = img), size = 0.10) +
+  geom_smooth(se = F, method = lm) +
+  labs(x = "Blocks per 48 minutes",
+       y = "Matchup Difficulty",
+       subtitle = "2022-23 Season",
+       title = "Matchup Difficulty is less Important for Shot Blockers",
+       caption = "Data via NBA.com and hoopR | Graph by Ayush Batra")
+
+# This looks at how matchup difficulty looks for shot blockers and 
+# non-shot blockers
+defense %>%
+  mutate(shot_blocker = ifelse(BLK_48 >= 2,"Shot Blocker", "Other")) %>%
+  ggplot(aes(x = shot_blocker, y = avg_PTS)) +
+  geom_violin(fill = '#c652ad') +
+  labs(x = "",
+       y = "Matchup Difficulty",
+       subtitle = "2022-23 Season | Shot Blocker = 2+ BLK / 48 min",
+       title = "Matchup Difficulty Irrelevant for Rim Protectors",
+       caption = "Data via NBA.com and hoopR | Graph by Ayush Batra")
+  
+
+```
+
+After that, I looked at how matchup difficulty is related to player scoring production. (Edit: I actually removed this part from the article to make it a bit shorter but basically the graph shows that defensive matchup difficulty is negatively associated with player scoring, meaning that players who score a lot tend to have easier defensive matchups.)
+
+```{r}
+#| label: scoring
+
+scoring <- matchup_diff %>%
+  inner_join(points, by = c("DEF_PLAYER_ID" = "PLAYER_ID"))
+
+scoring %>%
+  mutate(DEF_PLAYER_ID = as.numeric(DEF_PLAYER_ID)) %>%
+  left_join(headshots, by = c("DEF_PLAYER_ID" = "idPlayer")) %>%
+  mutate(radius = ((PTS - 10)/30)^2 + ((avg_PTS - 20)/6)^2) %>%
+  mutate(show = PTS > 37.5 | avg_PTS > 26 | radius > 1) %>%
+  mutate(img = ifelse(show, urlPlayerHeadshot, NA)) %>%
+  ggplot(aes(x = PTS, y = avg_PTS)) +
+  geom_point(shape = 21, fill = "#c652ad", color = 'black') +
+  geom_image(aes(image = img), size = 0.10) +
+  geom_smooth(method = lm, se = F) +
+  labs(x = "Points Scored per 100 Possessions",
+       y = "Matchup Difficulty",
+       subtitle = "2022-23 Season",
+       title = "More Scoring = Lower Matchup Difficulty",
+       caption = "Data via NBA.com and hoopR | Graph by Ayush Batra")
+
+```
+
+# How Defenders Impact Top Scorers
+
+Lastly, I wanted to explore if players with a high defensive matchup difficulty actually give great scorers a hard time. The results below show that the usage rate and efficiency of high scorers decreases when guarded by a player with high defensive matchup difficulty, meaning that players with high defensive matchup difficulty are indeed great defenders. 
+
+```{r}
+#| label: usg-and-eff
+
+major_players <- offense
+
+player_tms <- offense %>%
+  select(PLAYER_ID, TEAM)
+
+# Major scorers are players in the top 50 of PTS/100 (among qualifying players)
+major_scorers <- major_players %>%
+  filter(MIN >= 1000) %>%
+  mutate(Rank = rank(-PTS)) %>%
+  filter(Rank <= 50)
+
+major_defenders <- matchup_diff %>%
+  group_by(DEF_PLAYER_ID) %>%
+  summarize(PLAYER_NAME = first(PLAYER_NAME),
+            MIN = sum(MIN),
+            avg_PTS = weighted.mean(avg_PTS, w = POSS)) %>%
+  ungroup()
+
+# Major defenders are player in the top 50 of matchup difficulty 
+# (among qualifying players)
+major_defenders <- major_defenders %>%
+  mutate(PCT = rank(avg_PTS) / nrow(major_defenders)) %>%
+  filter(MIN >= 1000) %>%
+  mutate(Rank = rank(-avg_PTS)) %>%
+  filter(Rank <= 50) %>%
+  left_join(player_tms, by = c("DEF_PLAYER_ID" = "PLAYER_ID"))
+
+major_scorer_ids <- major_scorers %>%
+  pull(PLAYER_ID)
+
+major_defender_ids <- major_defenders %>%
+  pull(DEF_PLAYER_ID)
+
+
+# This loops over all teams to get every player vs player matchup from the season
+# Hopefully this still works, but in case it doesn't I uploaded the data to github
+raw_matchups <- tibble()
+iter <- 0
+for (id in list_IDs) {
+  slug <- team_info %>%
+    filter(idTeam == as.numeric(id)) %>%
+    select(slugTeam) %>%
+    pull()
+  
+  matchups <- nba_leagueseasonmatchups(def_team_id = id,
+                                       season = SEASON)
+  matchups <- matchups[["SeasonMatchups"]]
+  
+  raw_matchups <- rbind(raw_matchups, matchups)
+  
+  iter <- iter + 1
+  print(paste("Loaded ",iter,"/30 Teams", sep = ""))
+}
+
+# If the above loop times out or doesn't work, uncomment the lines below
+# f <- paste("https://raw.githubusercontent.com/AyushBatra15/Matchup",
+#            "-Difficulty/main/data/raw_matchups.csv", sep = "")
+# raw_matchups <- read_csv(file = f)
+
+all_matchups <- raw_matchups %>%
+  mutate(major_scorer = ifelse(OFF_PLAYER_ID %in% major_scorer_ids, 1, 0),
+         major_defender = ifelse(DEF_PLAYER_ID %in% major_defender_ids, 1, 0))
+
+all_matchups <- all_matchups %>%
+  mutate(across(c(PARTIAL_POSS : SFL), as.numeric)) %>%
+  mutate(Player_Poss = MATCHUP_FGA + MATCHUP_TOV + 0.44*MATCHUP_FTA)
+
+# The table below summarizes some of the findings
+# There are 4 categories
+# The categories are the 4 combinations of 
+# (major scorer / non-major scorer) vs (major defender / non-major defender)
+by_split <- all_matchups %>%
+  filter(PARTIAL_POSS >= 1) %>%
+  group_by(major_scorer, major_defender) %>%
+  summarize(POSS = sum(PARTIAL_POSS),
+            Player_POSS = sum(Player_Poss),
+            PTS = sum(PLAYER_PTS),
+            USG = Player_POSS / POSS,
+            Efficiency = PTS / Player_POSS) %>%
+  ungroup()
+
+all_matchups <- all_matchups %>%
+  filter(PARTIAL_POSS >= 1) %>%
+  mutate(USG = Player_Poss / PARTIAL_POSS,
+         Efficiency = PLAYER_PTS / Player_Poss) %>%
+  mutate(Efficiency = ifelse(is.nan(Efficiency), 0, Efficiency))
+
+# This pretty much is the same as the by_split table, but it is only for 
+# usage and also adds the lower and upper bound for a 99% confidence interval
+usg_stats <- all_matchups %>%
+  group_by(major_scorer, major_defender) %>%
+  mutate(avg_USG = sum(Player_Poss) / sum(PARTIAL_POSS)) %>%
+  ungroup() %>%
+  mutate(d = (USG - avg_USG)^2) %>%
+  group_by(major_scorer, major_defender) %>%
+  summarize(POSS = sum(PARTIAL_POSS),
+            USG = sum(Player_Poss) / sum(PARTIAL_POSS),
+            sd = weighted.mean(d, w = PARTIAL_POSS)) %>%
+  ungroup() %>%
+  mutate(se = sqrt(USG * (1 - USG) / POSS),
+         lower = USG + qnorm(0.005) * se,
+         upper = USG + qnorm(0.995) * se)
+
+# This pretty much is the same as the by_split table, but it is only for 
+# efficiency and also adds the lower and upper bound for a 99% confidence 
+# interval
+eff_stats <- all_matchups %>%
+  group_by(major_scorer, major_defender) %>%
+  mutate(avg_EFF = sum(PLAYER_PTS) / sum(Player_Poss)) %>%
+  ungroup() %>%
+  mutate(d = (Efficiency - avg_EFF)^2) %>%
+  group_by(major_scorer, major_defender) %>%
+  summarize(POSS = sum(Player_Poss),
+            Efficiency = sum(PLAYER_PTS) / sum(Player_Poss),
+            sd = weighted.mean(d, w = Player_Poss)) %>%
+  ungroup() %>%
+  mutate(se = sd / sqrt(POSS),
+         lower = Efficiency + qnorm(0.005) * se,
+         upper = Efficiency + qnorm(0.995) * se)
+
+usg_stats %>%
+  arrange(-major_scorer, -major_defender) %>%
+  mutate(ms = ifelse(major_scorer == 1, "Scorer", "Non-Scorer"),
+         md = ifelse(major_defender == 1, "Stopper", "Non-Stopper")) %>%
+  ggplot(aes(x = ms, y = USG, fill = md)) +
+  geom_col(color = 'black', width = 0.8, position = 'dodge') +
+  labs(y = "Offensive Player Usage",
+       x = "Offensive Player Category",
+       fill = "Defender Category",
+       subtitle = "2022-23 Season",
+       title = "The Best Defenders can Limit Star Usage",
+       caption = "Data via NBA.com and hoopR | Graph by Ayush Batra") +
+  scale_y_continuous(labels = scales::percent) +
+  theme(legend.position = 'top')
+
+average_efficiency <- all_matchups %>%
+  summarize(Efficiency = sum(PLAYER_PTS) / sum(Player_Poss)) %>%
+  as.numeric()
+
+eff_stats %>%
+  arrange(-major_scorer, -major_defender) %>%
+  mutate(eff = Efficiency - average_efficiency,
+         low = lower - average_efficiency,
+         upp = upper - average_efficiency) %>%
+  mutate(ms = ifelse(major_scorer == 1, "Scorer", "Non-Scorer"),
+         md = ifelse(major_defender == 1, "Stopper", "Non-Stopper")) %>%
+  ggplot(aes(x = ms, y = eff, fill = md)) +
+  geom_col(color = 'black', width = 0.8, position = 'dodge') +
+  geom_errorbar(aes(ymin = low, ymax = upp), width = 0.2, 
+                position = position_dodge(0.8)) +
+  labs(y = "Offensive Player Efficiency (above average)",
+       x = "Offensive Player Category",
+       fill = "Defender Category",
+       title = "The Best Defenders can Limit Star Efficiency",
+       subtitle = "2022-23 Season",
+       caption = "Data via NBA.com and hoopR | Graph by Ayush Batra") +
+  theme(legend.position = 'top')
+
+```
+
+# 2022-23 Playoffs Best Defenders
+
+Finally, the code below shows the top 2 players in defensive matchup difficulty for the 20 NBA teams that made the Play-In Tournament or Playoffs in 2022-23. 
+
+```{r}
+#| label: playoffs
+
+east_playoff_teams <- tibble(
+  seed = c(1:10),
+  tm = c("MIL","BOS","PHI","CLE","NYK","BKN","MIA","ATL","TOR","CHI")
+)
+
+west_playoff_teams <- tibble(
+  seed = c(1:10),
+  tm = c("DEN","MEM","SAC","PHX","LAC","GSW","LAL","MIN","NOP","OKC")
+)
+
+
+headshots <- df_dict_nba_players %>%
+  select(idPlayer, urlPlayerHeadshot)
+tm_logos <- espn_nba_teams() %>%
+  select(display_name, logo)
+
+tm_conversion <- team_info %>%
+  select(slugTeam, nameTeam)
+
+now_teams <- offense %>%
+  select(PLAYER_ID, TEAM)
+
+color_scale <- col_numeric(c("#E09D9D","#E4DBD7","#87B87E"), 
+                           domain = c(0, 100), 
+                           alpha = 0.75)
+
+east_defenders <- matchup_diff %>%
+  group_by(DEF_PLAYER_ID) %>%
+  summarize(PLAYER_NAME = first(PLAYER_NAME),
+            MIN = mean(MIN),
+            avg_PTS = weighted.mean(avg_PTS, w = POSS),
+            simple_eff = weighted.mean(simple_eff, w = POSS)) %>%
+  ungroup() %>%
+  mutate(PCT_Diff = rank(avg_PTS) / 
+           nrow(distinct(matchup_diff, DEF_PLAYER_ID)),
+         PCT_Eff = rank(-simple_eff) / 
+           nrow(distinct(matchup_diff, DEF_PLAYER_ID)),
+         PCT_Diff = 100 * PCT_Diff,
+         PCT_Eff = 100 * PCT_Eff) %>%
+  mutate(DEF_PLAYER_ID = as.character(DEF_PLAYER_ID)) %>%
+  left_join(now_teams, by = c("DEF_PLAYER_ID" = "PLAYER_ID")) %>%
+  mutate(DEF_PLAYER_ID = as.numeric(DEF_PLAYER_ID)) %>%
+  left_join(headshots, by = c("DEF_PLAYER_ID" = "idPlayer")) %>%
+  left_join(tm_conversion, by = c("TEAM" = "slugTeam")) %>%
+  left_join(tm_logos, by = c("nameTeam" = "display_name")) %>%
+  group_by(TEAM) %>%
+  mutate(Rk = rank(-avg_PTS)) %>%
+  ungroup() %>%
+  filter(Rk <= 2) %>%
+  inner_join(east_playoff_teams, by = c("TEAM" = "tm")) %>%
+  arrange(seed, -avg_PTS) %>%
+  select(seed, urlPlayerHeadshot, PLAYER_NAME, logo, MIN, avg_PTS, PCT_Diff,
+         simple_eff, PCT_Eff) %>%
+  gt() %>%
+  tab_header(title = "Most Difficult Defensive Matchup: East Playoff Teams",
+             subtitle = "2022-23 NBA Regular Season | At least 1000 minutes") %>%
+  cols_label(seed = "Seed",
+             urlPlayerHeadshot = "",
+             PLAYER_NAME = "Player",
+             logo = "Tm",
+             avg_PTS = "DMD",
+             PCT_Diff = "Pct",
+             simple_eff = "Efficiency",
+             PCT_Eff = "Pct") %>%
+  fmt_number(c(avg_PTS), decimals = 1) %>%
+  fmt_number(c(simple_eff), decimals = 3) %>%
+  fmt_number(c(PCT_Diff, PCT_Eff), decimals = 0) %>%
+  tab_spanner(label = "Matchup Difficulty",
+              columns = c(avg_PTS, PCT_Diff)) %>%
+  tab_spanner(label = "Def. Efficiency",
+              columns = c(simple_eff, PCT_Eff)) %>%
+  tab_footnote(footnote = "Minutes Played", 
+               locations = cells_column_labels(columns = c(MIN))) %>%
+  tab_footnote(footnote = paste("DMD: Defensive Matchup Difficulty = Weighted",
+                                "Average of Offensive Matchup's Season Points",
+                                "per 100 Possessions"),
+               locations = cells_column_labels(columns = c(avg_PTS))) %>%
+  tab_footnote(footnote = "Pct: Percentile", 
+               locations = cells_column_labels(columns = c(PCT_Diff, PCT_Eff))) %>%
+  tab_footnote(footnote = paste("Efficiency: PTS / (FGA + TOV + 0.44 * FTA)", 
+                                "for offensive players guarded"),
+               locations = cells_column_labels(columns = c(simple_eff))) %>%
+  tab_style(list(cell_text(weight = 'bold', 
+                           align = 'center', 
+                           stretch = 'expanded')),
+            locations = cells_column_labels()) %>%
+  tab_style(list(cell_text(weight = 'bold', 
+                           align = 'center', 
+                           transform = 'uppercase', 
+                           stretch = 'expanded')),
+            locations = cells_column_spanners()) %>%
+  tab_style(list(cell_text(align = 'center')), 
+            locations = cells_body(columns = c(urlPlayerHeadshot, logo))) %>%
+  tab_style(list(cell_text(size = 20)),
+            locations = cells_body()) %>%
+  tab_style(list(cell_borders(sides = 'bottom', weight = px(3))),
+            locations = cells_column_labels()) %>%
+  data_color(columns = c(PCT_Diff, PCT_Eff), colors = color_scale) %>%
+  text_transform(locations = cells_body(columns = c(urlPlayerHeadshot, logo)),
+                 fn = function(x) {
+                   web_image(
+                     url = x,
+                     height = 50
+                   )
+                 }
+  ) %>%
+  cols_width(columns = c(avg_PTS, simple_eff, PCT_Diff, PCT_Eff) ~ px(80)) %>%
+  tab_options(table.background.color = "#E4DBD7",
+              heading.border.bottom.color = "#E4DBD7",
+              column_labels.border.bottom.width = 3,
+              column_labels.border.bottom.color = 'black',
+              table_body.hlines.color = 'black',
+              footnotes.border.bottom.color = 'black',
+              table_body.border.bottom.color = 'black',
+              table.border.bottom.color = 'black',
+              table.border.top.color = 'black',
+              table.border.left.color = 'black',
+              table.border.right.color = 'black')
+
+east_defenders
+
+
+
+west_defenders <- matchup_diff %>%
+  group_by(DEF_PLAYER_ID) %>%
+  summarize(PLAYER_NAME = first(PLAYER_NAME),
+            MIN = mean(MIN),
+            avg_PTS = weighted.mean(avg_PTS, w = POSS),
+            simple_eff = weighted.mean(simple_eff, w = POSS)) %>%
+  ungroup() %>%
+  mutate(PCT_Diff = rank(avg_PTS) / 
+           nrow(distinct(matchup_diff, DEF_PLAYER_ID)),
+         PCT_Eff = rank(-simple_eff) / 
+           nrow(distinct(matchup_diff, DEF_PLAYER_ID)),
+         PCT_Diff = 100 * PCT_Diff,
+         PCT_Eff = 100 * PCT_Eff) %>%
+  mutate(DEF_PLAYER_ID = as.character(DEF_PLAYER_ID)) %>%
+  left_join(now_teams, by = c("DEF_PLAYER_ID" = "PLAYER_ID")) %>%
+  mutate(DEF_PLAYER_ID = as.numeric(DEF_PLAYER_ID)) %>%
+  left_join(headshots, by = c("DEF_PLAYER_ID" = "idPlayer")) %>%
+  left_join(tm_conversion, by = c("TEAM" = "slugTeam")) %>%
+  left_join(tm_logos, by = c("nameTeam" = "display_name")) %>%
+  group_by(TEAM) %>%
+  mutate(Rk = rank(-avg_PTS)) %>%
+  ungroup() %>%
+  filter(Rk <= 2) %>%
+  inner_join(west_playoff_teams, by = c("TEAM" = "tm")) %>%
+  arrange(seed, -avg_PTS) %>%
+  select(seed, urlPlayerHeadshot, PLAYER_NAME, logo, MIN, avg_PTS, PCT_Diff,
+         simple_eff, PCT_Eff) %>%
+  gt() %>%
+  tab_header(title = "Most Difficult Defensive Matchup: West Playoff Teams",
+             subtitle = "2022-23 NBA Regular Season | At least 1000 minutes") %>%
+  cols_label(seed = "Seed",
+             urlPlayerHeadshot = "",
+             PLAYER_NAME = "Player",
+             logo = "Tm",
+             avg_PTS = "DMD",
+             PCT_Diff = "Pct",
+             simple_eff = "Efficiency",
+             PCT_Eff = "Pct") %>%
+  fmt_number(c(avg_PTS), decimals = 1) %>%
+  fmt_number(c(simple_eff), decimals = 3) %>%
+  fmt_number(c(PCT_Diff, PCT_Eff), decimals = 0) %>%
+  tab_spanner(label = "Matchup Difficulty",
+              columns = c(avg_PTS, PCT_Diff)) %>%
+  tab_spanner(label = "Def. Efficiency",
+              columns = c(simple_eff, PCT_Eff)) %>%
+  tab_footnote(footnote = "Minutes Played", 
+               locations = cells_column_labels(columns = c(MIN))) %>%
+  tab_footnote(footnote = paste("DMD: Defensive Matchup Difficulty = Weighted",
+                                "Average of Offensive Matchup's Season Points",
+                                "per 100 Possessions"),
+               locations = cells_column_labels(columns = c(avg_PTS))) %>%
+  tab_footnote(footnote = "Pct: Percentile", 
+               locations = cells_column_labels(columns = c(PCT_Diff, PCT_Eff))) %>%
+  tab_footnote(footnote = paste("Efficiency: PTS / (FGA + TOV + 0.44 * FTA)", 
+                                "for offensive players guarded"),
+               locations = cells_column_labels(columns = c(simple_eff))) %>%
+  tab_style(list(cell_text(weight = 'bold', 
+                           align = 'center', 
+                           stretch = 'expanded')),
+            locations = cells_column_labels()) %>%
+  tab_style(list(cell_text(weight = 'bold', 
+                           align = 'center', 
+                           transform = 'uppercase', 
+                           stretch = 'expanded')),
+            locations = cells_column_spanners()) %>%
+  tab_style(list(cell_text(align = 'center')), 
+            locations = cells_body(columns = c(urlPlayerHeadshot, logo))) %>%
+  tab_style(list(cell_text(size = 20)),
+            locations = cells_body()) %>%
+  tab_style(list(cell_borders(sides = 'bottom', weight = px(3))),
+            locations = cells_column_labels()) %>%
+  data_color(columns = c(PCT_Diff, PCT_Eff), colors = color_scale) %>%
+  text_transform(locations = cells_body(columns = c(urlPlayerHeadshot, logo)),
+                 fn = function(x) {
+                   web_image(
+                     url = x,
+                     height = 50
+                   )
+                 }
+  ) %>%
+  cols_width(columns = c(avg_PTS, simple_eff, PCT_Diff, PCT_Eff) ~ px(80)) %>%
+  tab_options(table.background.color = "#E4DBD7",
+              heading.border.bottom.color = "#E4DBD7",
+              column_labels.border.bottom.width = 3,
+              column_labels.border.bottom.color = 'black',
+              table_body.hlines.color = 'black',
+              footnotes.border.bottom.color = 'black',
+              table_body.border.bottom.color = 'black',
+              table.border.bottom.color = 'black',
+              table.border.top.color = 'black',
+              table.border.left.color = 'black',
+              table.border.right.color = 'black')
+
+west_defenders
+```
+
+That's it!
+
+Thanks for looking at the code!
+
+
